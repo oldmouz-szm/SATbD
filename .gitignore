@@ -1,0 +1,7 @@
+satbd
+*.o
+*.d
+*.cnf
+*.xor
+*.result
+paper.txt

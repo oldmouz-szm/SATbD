@@ -1,0 +1,11 @@
+# Auto-generated observation
+# faults=6,7
+# inputs
+1=1
+2=0
+3=1
+6=1
+7=0
+# outputs
+22=1
+23=1
