@@ -5,3 +5,4 @@ satbd
 *.xor
 *.result
 paper.txt
+.ssh/
