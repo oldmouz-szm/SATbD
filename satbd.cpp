@@ -23,11 +23,17 @@
 #include <ctime>
 #include <memory>
 #include <cstdlib>
+#include <dirent.h>
+#include <sys/stat.h>
+#include <iomanip>
 
 #include "minisat/core/Solver.h"
 
 using namespace std;
 using Minisat::lbool;
+
+// 全局静默开关（批处理时设为 true 以禁用冗长的调试输出）
+static bool g_quiet = false;
 
 enum GateType { GATE_AND, GATE_NAND, GATE_OR, GATE_NOR, GATE_XOR, GATE_XNOR, GATE_NOT, GATE_BUF, GATE_INPUT };
 
@@ -43,6 +49,25 @@ struct Observation {
     map<int, int> input_values;
     map<int, int> output_values;
     set<int> fault_set;
+};
+
+struct DiagnosisResult {
+    string obs_file;
+    int diagnosis_index;
+    bool solved;
+    double time_seconds;      // 单个诊断用时
+    double cumulative_seconds; // 累计用时
+    int diag_size;
+    set<int> diag_components;
+};
+
+struct BatchResult {
+    string circuit_name;
+    vector<DiagnosisResult> results;
+    double total_time;
+    int total_diagnoses;
+    double prep_time;      // 预处理时间
+    double online_time;    // 在线时间
 };
 
 struct Section {
@@ -396,9 +421,88 @@ Observation parse_observation(const string& filename) {
     return obs;
 }
 
+bool is_directory(const string& path) {
+    struct stat info;
+    if (stat(path.c_str(), &info) != 0) return false;
+    return (info.st_mode & S_IFDIR) != 0;
+}
+
+vector<string> get_obs_files(const string& dir_path, const string& circuit_name) {
+    vector<string> files;
+    DIR* dir = opendir(dir_path.c_str());
+    if (dir == nullptr) {
+        cerr << "Error: cannot open directory: " << dir_path << endl;
+        return files;
+    }
+    struct dirent* entry;
+    while ((entry = readdir(dir)) != nullptr) {
+        string name = entry->d_name;
+        if (name == "." || name == "..") continue;
+        if (name.find("_obs_") != string::npos && name.find(".txt") != string::npos) {
+            if (name.find(circuit_name) == 0) {
+                files.push_back(dir_path + "/" + name);
+            }
+        }
+    }
+    closedir(dir);
+    sort(files.begin(), files.end());
+    return files;
+}
+
+string extract_filename(const string& path) {
+    size_t pos = path.find_last_of("/\\");
+    if (pos == string::npos) return path;
+    return path.substr(pos + 1);
+}
+
+void print_table_header() {
+    cout << "\n";
+    cout << left << setw(25) << "obs"
+         << "|" << setw(10) << "solved"
+         << "|" << setw(12) << "cumulative"
+         << "|" << setw(10) << "diag_size"
+         << "|" << "diag_components" << endl;
+    cout << string(90, '-') << endl;
+}
+
+void print_diagnosis_row(const string& obs_name, int idx, bool solved, double cumulative_time, int size, const set<int>& comps) {
+    stringstream comp_str;
+    bool first = true;
+    for (int c : comps) {
+        if (!first) comp_str << "|";
+        comp_str << c;
+        first = false;
+    }
+    
+    string idx_str = "[" + to_string(idx) + "]";
+    string full_name = obs_name + idx_str;
+    
+    cout << left << setw(25) << full_name
+         << "|" << setw(10) << (solved ? "1" : "0")
+         << "|" << setw(12) << fixed << setprecision(6) << cumulative_time
+         << "|" << setw(10) << size
+         << "|" << comp_str.str() << endl;
+}
+
+void print_batch_summary(const BatchResult& result) {
+    cout << "\n  " << result.total_diagnoses << " diagnoses enumerated in " 
+         << fixed << setprecision(2) << result.total_time << "s" << endl;
+    cout << "  Preprocessing time: " << fixed << setprecision(6) << result.prep_time << "s" << endl;
+    cout << "  Online time: " << fixed << setprecision(6) << result.online_time << "s" << endl;
+    cout << "  Total time: " << fixed << setprecision(6) << result.total_time << "s" << endl;
+}
+
 class SATbDSolver {
 private:
     Circuit& circuit;
+
+    struct BEEModel {
+        map<int, int> fixed_values;
+        map<int, pair<int, bool>> equivalences;
+        set<int> eliminated_gates;
+        int original_vars;
+        int simplified_vars;
+    };
 
     Minisat::Lit mlit(Minisat::Var v, bool sign = false) {
         return Minisat::mkLit(v, sign);
@@ -738,7 +842,17 @@ private:
         vector<Minisat::Lit> healthy_lits;
     };
 
-    CoreModel buildCoreModel(const Observation& obs) {
+    void addWireEquivalence(Minisat::Solver& S, Minisat::Var src, Minisat::Var dst, bool negate) {
+        if (negate) {
+            addClause(S, {mlit(src), mlit(dst)});
+            addClause(S, {~mlit(src), ~mlit(dst)});
+        } else {
+            addClause(S, {mlit(src), ~mlit(dst)});
+            addClause(S, {~mlit(src), mlit(dst)});
+        }
+    }
+
+    CoreModel buildCoreModel(const Observation& obs, const BEEModel* bee = nullptr) {
         CoreModel model;
         model.solver = unique_ptr<Minisat::Solver>(new Minisat::Solver());
         Minisat::Solver& S = *model.solver;
@@ -749,6 +863,26 @@ private:
                     Minisat::Var v = S.newVar();
                     model.wire_vars[g.output] = v;
                 }
+                continue;
+            }
+            if (bee != nullptr && bee->equivalences.count(g.id)) {
+                auto getWire = [&](int w) -> Minisat::Var {
+                    if (model.wire_vars.count(w)) return model.wire_vars[w];
+                    Minisat::Var v = S.newVar();
+                    model.wire_vars[w] = v;
+                    return v;
+                };
+                auto getHealth = [&](int component_id) -> Minisat::Var {
+                    if (model.health_vars.count(component_id)) return model.health_vars[component_id];
+                    Minisat::Var v = S.newVar();
+                    model.health_vars[component_id] = v;
+                    return v;
+                };
+                auto eq = bee->equivalences.at(g.id);
+                Minisat::Var src = getWire(eq.first);
+                Minisat::Var out = getWire(g.output);
+                addWireEquivalence(S, src, out, eq.second);
+                addClause(S, {mlit(getHealth(g.id))});
                 continue;
             }
             addGateConstraint(S, g, model.wire_vars, model.health_vars, model.internal_vars);
@@ -765,6 +899,20 @@ private:
         }
         for (int d : circuit.dominated_components) {
             if (model.health_vars.count(d)) addClause(S, {mlit(model.health_vars[d])});
+        }
+        if (bee != nullptr) {
+            for (auto& p : bee->fixed_values) {
+                int key = p.first;
+                int val = p.second;
+                if (key > 0) {
+                    Minisat::Var v = model.wire_vars.count(key) ? model.wire_vars[key] : (model.wire_vars[key] = S.newVar());
+                    addClause(S, {val ? mlit(v) : ~mlit(v)});
+                } else {
+                    int gid = -key;
+                    Minisat::Var v = model.health_vars.count(gid) ? model.health_vars[gid] : (model.health_vars[gid] = S.newVar());
+                    addClause(S, {val ? mlit(v) : ~mlit(v)});
+                }
+            }
         }
         for (auto& sec : circuit.sections) {
             vector<Minisat::Lit> sec_unhealthy;
@@ -792,16 +940,9 @@ private:
         return diag;
     }
 
-public:
-    SATbDSolver(Circuit& c) : circuit(c) {}
-
-    set<int> findMinCardDiagnosis(const Observation& obs) {
+    set<int> solveMinDiagnosisOnModel(CoreModel& model, int k_ub) {
         set<int> comps = circuit.get_component_gates();
-        CoreModel model = buildCoreModel(obs);
         Minisat::Solver& S = *model.solver;
-        int k_ub = findUpperBound(obs);
-        int num_outputs = circuit.outputs.size();
-        k_ub = min(k_ub, num_outputs);
         k_ub = min(k_ub, (int)model.unhealthy_lits.size());
         if (k_ub < 0) return {};
         vector<Minisat::Lit> selectors(k_ub + 1);
@@ -813,7 +954,6 @@ public:
         int lo = 0;
         int hi = k_ub;
         int best_k = -1;
-        set<int> best_diag;
         while (lo <= hi) {
             int mid = (lo + hi) / 2;
             Minisat::vec<Minisat::Lit> assumptions;
@@ -821,10 +961,8 @@ public:
             bool sat = S.solve(assumptions);
             if (sat) {
                 set<int> diag = extractDiagnosis(comps, model.health_vars, S);
-                int dcard = (int)diag.size();
                 best_k = mid;
-                best_diag = diag;
-                hi = min(mid - 1, dcard - 1);
+                hi = min(mid - 1, (int)diag.size() - 1);
             } else {
                 lo = mid + 1;
             }
@@ -832,46 +970,64 @@ public:
         if (best_k < 0) return {};
         Minisat::vec<Minisat::Lit> assumptions;
         assumptions.push(selectors[best_k]);
-        bool sat = S.solve(assumptions);
-        if (!sat) return {};
+        if (!S.solve(assumptions)) return {};
         return extractDiagnosis(comps, model.health_vars, S);
     }
 
-    set<set<int>> findAllMinCardDiagnoses(const Observation& obs) {
-        set<int> min_diag = findMinCardDiagnosis(obs);
-        if (min_diag.empty()) return {};
-        int card = (int)min_diag.size();
+    set<set<int>> enumerateAllMinDiagnosesOnModel(CoreModel& model, int card, const Observation& obs, double time_limit = 0.0) {
         set<int> comps = circuit.get_component_gates();
-        CoreModel model = buildCoreModel(obs);
         Minisat::Solver& S = *model.solver;
         addCardinalityLits(S, model.unhealthy_lits, card);
         int n = model.unhealthy_lits.size();
-        int healthy_limit = n - card;
-        addCardinalityLits(S, model.healthy_lits, healthy_limit);
+        addCardinalityLits(S, model.healthy_lits, n - card);
         set<set<int>> tld_set;
+        clock_t start = clock();
         while (S.solve()) {
             set<int> diag = extractDiagnosis(comps, model.health_vars, S);
             Minisat::vec<Minisat::Lit> blocking;
             for (int c : comps) {
                 if (model.health_vars.count(c) == 0) continue;
                 Minisat::Var v = model.health_vars[c];
-                if (S.modelValue(mlit(v)) == l_False) {
-                    blocking.push(mlit(v));
-                } else {
-                    blocking.push(~mlit(v));
-                }
+                if (S.modelValue(mlit(v)) == l_False) blocking.push(mlit(v));
+                else blocking.push(~mlit(v));
             }
             tld_set.insert(diag);
             S.addClause(blocking);
+            if (time_limit > 0.0) {
+                double elapsed = double(clock() - start) / CLOCKS_PER_SEC;
+                if (elapsed >= time_limit) break;
+            }
         }
-
         set<set<int>> all_diagnoses;
         for (auto& tld : tld_set) {
             set<set<int>> expanded = expandTLD(tld, obs);
             for (auto& d : expanded) all_diagnoses.insert(d);
         }
-
         return all_diagnoses;
+    }
+
+public:
+    SATbDSolver(Circuit& c) : circuit(c) {}
+
+    set<int> findMinCardDiagnosis(const Observation& obs) {
+        CoreModel model = buildCoreModel(obs);
+        int k_ub = findUpperBound(obs);
+        int num_outputs = circuit.outputs.size();
+        k_ub = min(k_ub, num_outputs);
+        return solveMinDiagnosisOnModel(model, k_ub);
+    }
+
+    set<set<int>> findAllMinCardDiagnoses(const Observation& obs, bool use_bee = false, double time_limit = 0.0) {
+        set<int> min_diag = use_bee ? findMinCardDiagnosisBEE(obs, false, true) : findMinCardDiagnosis(obs);
+        if (min_diag.empty()) return {};
+        int card = (int)min_diag.size();
+        if (use_bee) {
+            BEEModel bee = equiPropagation(obs);
+            CoreModel model = buildCoreModel(obs, &bee);
+            return enumerateAllMinDiagnosesOnModel(model, card, obs, time_limit);
+        }
+        CoreModel model = buildCoreModel(obs);
+        return enumerateAllMinDiagnosesOnModel(model, card, obs, time_limit);
     }
 
     set<set<int>> expandTLD(const set<int>& tld, const Observation& obs) {
@@ -911,14 +1067,6 @@ public:
         }
         return result;
     }
-
-    struct BEEModel {
-        map<int, int> fixed_values;
-        map<int, pair<int, bool>> equivalences;
-        set<int> eliminated_gates;
-        int original_vars;
-        int simplified_vars;
-    };
 
     BEEModel equiPropagation(const Observation& obs) {
         BEEModel model;
@@ -1068,8 +1216,10 @@ public:
         model.original_vars = (int)(circuit.gates.size() * 3);
         model.simplified_vars = model.original_vars - (int)model.fixed_values.size() * 2;
 
-        cout << "  BEE equi-propagation: " << model.fixed_values.size() << " fixed values, "
-             << model.equivalences.size() << " equivalences detected" << endl;
+           if (!g_quiet) {
+              cout << "  BEE equi-propagation: " << model.fixed_values.size() << " fixed values, "
+                  << model.equivalences.size() << " equivalences detected" << endl;
+           }
 
         return model;
     }
@@ -1492,86 +1642,127 @@ public:
     }
 
     set<int> findMinCardDiagnosisBEE(const Observation& obs, bool use_cryptominisat, bool use_bee = true) {
-        BEEModel bee;
-        if (use_bee) {
-            cout << "Running BEE-enhanced diagnosis..." << endl;
-            bee = equiPropagation(obs);
-        } else {
-            cout << "Running diagnosis (no BEE)..." << endl;
+        if (use_cryptominisat && !g_quiet) {
+            cout << "  CryptoMiniSat backend requested, but local MiniBEE currently uses unified incremental MiniSat fallback." << endl;
         }
-
-        bool use_xor = use_cryptominisat;
-        DimacsCNF cnf = encodeToDimacs(obs, bee, use_xor);
-
-        cout << "  CNF: " << cnf.num_vars << " vars, " << cnf.clauses.size() << " clauses";
-        if (!cnf.xor_clauses.empty()) cout << ", " << cnf.xor_clauses.size() << " XOR clauses";
-        cout << endl;
-
         int k_ub = findUpperBound(obs);
         int num_outputs = circuit.outputs.size();
         k_ub = min(k_ub, num_outputs);
-
-        set<int> comps = circuit.get_component_gates();
-        int num_health_vars = 0;
-        for (int c : comps) {
-            if (cnf.health_to_var.count(c)) num_health_vars++;
+        if (!use_bee) {
+            CoreModel model = buildCoreModel(obs);
+            return solveMinDiagnosisOnModel(model, k_ub);
         }
-        k_ub = min(k_ub, num_health_vars);
-
-        if (k_ub < 0) return {};
-
-        set<int> last_diagnosis;
-        int lo = 0, hi = k_ub;
-
-        while (lo <= hi) {
-            int mid = (lo + hi) / 2;
-            string prefix = "k" + to_string(mid) + "_" + to_string(clock());
-
-            CMSatResult res = solveWithCryptoMiniSat(cnf, mid, prefix);
-
-            if (res.sat) {
-                set<int> diag;
-                for (int c : comps) {
-                    if (cnf.health_to_var.count(c)) {
-                        int v = cnf.health_to_var[c];
-                        if (res.assignment.count(v) && !res.assignment[v]) {
-                            diag.insert(c);
-                        }
-                    }
-                }
-                last_diagnosis = diag;
-                hi = (int)diag.size() - 1;
-                if (hi < lo) break;
-            } else {
-                lo = mid + 1;
-            }
-        }
-
-        if (!last_diagnosis.empty()) {
-            string prefix = "final_" + to_string(clock());
-            CMSatResult res = solveWithCryptoMiniSat(cnf, (int)last_diagnosis.size(), prefix);
-            if (res.sat) {
-                last_diagnosis.clear();
-                for (int c : comps) {
-                    if (cnf.health_to_var.count(c)) {
-                        int v = cnf.health_to_var[c];
-                        if (res.assignment.count(v) && !res.assignment[v]) {
-                            last_diagnosis.insert(c);
-                        }
-                    }
-                }
-            }
-        }
-
-        return last_diagnosis;
+        if (!g_quiet) cout << "Running local MiniBEE-enhanced diagnosis..." << endl;
+        BEEModel bee = equiPropagation(obs);
+        CoreModel model = buildCoreModel(obs, &bee);
+           if (!g_quiet) {
+              cout << "  MiniBEE core: " << model.health_vars.size() << " health vars, "
+                  << model.wire_vars.size() << " wire vars" << endl;
+           }
+        return solveMinDiagnosisOnModel(model, k_ub);
     }
 };
 
+BatchResult process_single_obs(const string& bench_file, const string& obs_file, 
+                                bool find_all, bool use_bee, bool use_cryptominisat) {
+    BatchResult result;
+    result.circuit_name = extract_filename(bench_file);
+    result.total_time = 0;
+    result.total_diagnoses = 0;
+    
+    bool bee_available = use_bee;
+    bool cms_available = false;
+    
+    if (use_cryptominisat) {
+        string check_py = "python3 -c \"from pycryptosat import Solver\" >/dev/null 2>&1";
+        cms_available = (std::system(check_py.c_str()) == 0);
+    }
+    
+    Circuit circuit;
+    circuit.parse_bench(bench_file);
+    
+    clock_t t0 = clock();
+    circuit.preprocess();
+    clock_t t1 = clock();
+    double prep_time = double(t1 - t0) / CLOCKS_PER_SEC;
+    
+    Observation obs = parse_observation(obs_file);
+    
+    SATbDSolver solver(circuit);
+    
+    t0 = clock();
+    set<int> min_diag;
+    
+    if (bee_available && cms_available) {
+        min_diag = solver.findMinCardDiagnosisBEE(obs, true);
+    } else if (bee_available && !cms_available) {
+        min_diag = solver.findMinCardDiagnosisBEE(obs, false);
+    } else if (!bee_available && cms_available) {
+        min_diag = solver.findMinCardDiagnosisBEE(obs, true, false);
+    } else {
+        min_diag = solver.findMinCardDiagnosis(obs);
+    }
+    t1 = clock();
+    
+    double diag_time = double(t1 - t0) / CLOCKS_PER_SEC;
+    string obs_name = extract_filename(obs_file);
+    
+    if (find_all && !min_diag.empty()) {
+        t0 = clock();
+        double base_time = prep_time + diag_time;
+        const double TIME_LIMIT = 300.0; // seconds
+        double remaining = TIME_LIMIT - diag_time;
+        if (remaining < 0) remaining = 0;
+        set<set<int>> all_diags = solver.findAllMinCardDiagnoses(obs, bee_available, remaining);
+        t1 = clock();
+        double all_time = double(t1 - t0) / CLOCKS_PER_SEC;
+        
+        int idx = 1;
+        double current_time = base_time;
+        double time_per_diag = all_time / max(1, (int)all_diags.size());
+        
+        for (auto& d : all_diags) {
+            current_time += time_per_diag;
+            DiagnosisResult dr;
+            dr.obs_file = obs_name;
+            dr.diagnosis_index = idx++;
+            dr.solved = true;
+            dr.time_seconds = time_per_diag;
+            dr.cumulative_seconds = current_time;
+            dr.diag_size = d.size();
+            dr.diag_components = d;
+            result.results.push_back(dr);
+        }
+        result.total_diagnoses = all_diags.size();
+        result.total_time = prep_time + diag_time + all_time;
+        result.prep_time = prep_time;
+        result.online_time = diag_time + all_time;
+    } else {
+        double total_time = prep_time + diag_time;
+        DiagnosisResult dr;
+        dr.obs_file = obs_name;
+        dr.diagnosis_index = 1;
+        dr.solved = !min_diag.empty();
+        dr.time_seconds = diag_time;
+        dr.cumulative_seconds = total_time;
+        dr.diag_size = min_diag.size();
+        dr.diag_components = min_diag;
+        result.results.push_back(dr);
+        result.total_diagnoses = 1;
+        result.total_time = total_time;
+        result.prep_time = prep_time;
+        result.online_time = diag_time;
+    }
+    
+    return result;
+}
+
 int main(int argc, char* argv[]) {
     if (argc < 3) {
-        cerr << "Usage: " << argv[0] << " <bench_file> <obs_file> [--all] [--use-bee] [--use-cryptominisat]" << endl;
+        cerr << "Usage: " << argv[0] << " <bench_file> <obs_file|obs_dir> [--all] [--use-bee] [--use-cryptominisat]" << endl;
         cerr << "  bench_file: ISCAS-85 .bench circuit file" << endl;
-        cerr << "  obs_file: observation file" << endl;
+        cerr << "  obs_file: single observation file" << endl;
+        cerr << "  obs_dir: directory containing observation files (batch mode)" << endl;
         cerr << "  --all: find all minimal cardinality diagnoses (optional)" << endl;
         cerr << "  --use-bee: prefer BEE/equi-propagation pipeline when available" << endl;
         cerr << "  --use-cryptominisat: prefer CryptoMiniSat backend when available" << endl;
@@ -1579,7 +1770,7 @@ int main(int argc, char* argv[]) {
     }
 
     string bench_file = argv[1];
-    string obs_file = argv[2];
+    string obs_path = argv[2];
     bool find_all = false;
     bool use_bee = false;
     bool use_cryptominisat = false;
@@ -1589,104 +1780,166 @@ int main(int argc, char* argv[]) {
         if (arg == "--use-bee") use_bee = true;
         if (arg == "--use-cryptominisat") use_cryptominisat = true;
     }
-
-    cout << "=== SATbD: SAT-based Diagnosis ===" << endl;
-    cout << "Circuit: " << bench_file << endl;
-    cout << "Observation: " << obs_file << endl;
-
-    bool bee_available = false;
-    bool cms_available = false;
-
-    if (use_bee) {
-        bee_available = true;
-        cout << "BEE equi-propagation: enabled" << endl;
+    
+    bool batch_mode = is_directory(obs_path);
+    
+    string circuit_name = extract_filename(bench_file);
+    size_t dot_pos = circuit_name.find('.');
+    if (dot_pos != string::npos) {
+        circuit_name = circuit_name.substr(0, dot_pos);
     }
-    if (use_cryptominisat) {
-        string check_py = "python3 -c \"from pycryptosat import Solver; print('ok')\" 2>/dev/null";
-        cms_available = (std::system(check_py.c_str()) == 0);
-        cout << "CryptoMiniSat (pycryptosat): " << (cms_available ? "available" : "not found") << endl;
-    }
+    
+    if (batch_mode) {
+        cout << "=== SATbD: SAT-based Diagnosis (Batch Mode) ===" << endl;
+        cout << "Circuit: " << bench_file << endl;
+        cout << "Observation directory: " << obs_path << endl;
+        // 在批处理模式中禁用内部调试/信息输出
+        g_quiet = true;
+        
+        vector<string> obs_files = get_obs_files(obs_path, circuit_name);
+        if (obs_files.empty()) {
+            cerr << "No observation files found for circuit '" << circuit_name << "' in directory: " << obs_path << endl;
+            return 1;
+        }
+        cout << "Found " << obs_files.size() << " observation files" << endl;
+        
+        if (use_bee) {
+            cout << "BEE: using built-in MiniBEE compiler/equi-propagation" << endl;
+        }
+        if (use_cryptominisat) {
+            string check_py = "python3 -c \"from pycryptosat import Solver\" >/dev/null 2>&1";
+            bool cms_available = (std::system(check_py.c_str()) == 0);
+            cout << "CryptoMiniSat (pycryptosat): " << (cms_available ? "available" : "not found") << endl;
+        }
+        
+        // 新表头：obs | time | num | size | all_size | real_num | hitrate | timeout
+        cout << left << setw(20) << "obs"
+             << "|" << setw(8) << "time"
+             << "|" << setw(6) << "num"
+             << "|" << setw(6) << "size"
+             << "|" << setw(8) << "all_size"
+             << "|" << setw(8) << "real_num"
+             << "|" << setw(8) << "hitrate"
+             << "|" << setw(8) << "timeout"
+             << endl;
+        cout << string(80, '-') << endl;
 
-    Circuit circuit;
-    circuit.parse_bench(bench_file);
+        int obs_cnt = obs_files.size();
+        double total_time = 0;
+        double total_hitrate = 0; // legacy, kept for compatibility
+        double total_hitrate_non_pseudo = 0; // only for non-pseudo obs
+        int non_pseudo_count = 0;
+        int total_success = 0;
+        double all_obs_time = 0;
 
-    cout << "Circuit loaded: " << circuit.gates.size() << " gates, "
-         << circuit.inputs.size() << " inputs, "
-         << circuit.outputs.size() << " outputs" << endl;
-
-    set<int> comps = circuit.get_component_gates();
-    cout << "Components (non-input gates): " << comps.size() << endl;
-
-    clock_t t0 = clock();
-    circuit.preprocess();
-    clock_t t1 = clock();
-    cout << "Preprocessing time: " << double(t1 - t0) / CLOCKS_PER_SEC << " sec" << endl;
-    cout << "Sections: " << circuit.sections.size() << endl;
-    cout << "Dominated components: " << circuit.dominated_components.size() << endl;
-    cout << "Top-level components: " << circuit.top_level_components.size() << endl;
-
-    Observation obs = parse_observation(obs_file);
-    cout << "Observation: " << obs.input_values.size() << " inputs, "
-         << obs.output_values.size() << " outputs" << endl;
-    if (!obs.fault_set.empty()) {
-        cout << "True faults (from obs file): ";
-        for (int f : obs.fault_set) cout << f << " ";
-        cout << "(cardinality=" << obs.fault_set.size() << ")" << endl;
-    }
-
-    SATbDSolver solver(circuit);
-
-    t0 = clock();
-    set<int> min_diag;
-
-    if (bee_available && cms_available) {
-        cout << "\nUsing BEE + CryptoMiniSat pipeline" << endl;
-        min_diag = solver.findMinCardDiagnosisBEE(obs, true);
-    } else if (bee_available && !cms_available) {
-        cout << "\nUsing BEE equi-propagation + MiniSat pipeline" << endl;
-        min_diag = solver.findMinCardDiagnosisBEE(obs, false);
-    } else if (!bee_available && cms_available) {
-        cout << "\nUsing CryptoMiniSat backend (no BEE)" << endl;
-        min_diag = solver.findMinCardDiagnosisBEE(obs, true, false);
-    } else {
-        min_diag = solver.findMinCardDiagnosis(obs);
-    }
-    t1 = clock();
-
-    cout << "\n--- Result ---" << endl;
-    if (min_diag.empty()) {
-        cout << "No diagnosis found (circuit may be consistent with observation)" << endl;
-    } else {
-        cout << "Minimal cardinality diagnosis (cardinality=" << min_diag.size() << "): ";
-        for (int c : min_diag) cout << c << " ";
-        cout << endl;
-        cout << "Diagnosis time: " << double(t1 - t0) / CLOCKS_PER_SEC << " sec" << endl;
-
-        if (!obs.fault_set.empty()) {
-            if (min_diag.size() == obs.fault_set.size()) {
-                cout << "Cardinality matches true fault set!" << endl;
+        for (const string& obs_file : obs_files) {
+            clock_t t0 = clock();
+            bool timeout = false;
+            double obs_time = 0;
+            set<set<int>> all_diags;
+            set<int> all_comps;
+            int min_size = 0;
+            int real_num = 0;
+            double hitrate = 0;
+            int num = 0;
+            string obs_name = extract_filename(obs_file);
+            Observation obs = parse_observation(obs_file);
+            Circuit circuit;
+            circuit.parse_bench(bench_file);
+            circuit.preprocess();
+            SATbDSolver solver(circuit);
+            // 限时300s
+            const double TIME_LIMIT = 300.0;
+            clock_t diag_t0 = clock();
+            set<int> min_diag = solver.findMinCardDiagnosis(obs);
+            clock_t diag_t1 = clock();
+            obs_time = double(diag_t1 - diag_t0) / CLOCKS_PER_SEC;
+            bool is_pseudo = min_diag.empty();
+            if (!is_pseudo) {
+                min_size = min_diag.size();
+                // 枚举所有最小解
+                clock_t all_t0 = clock();
+                all_diags = solver.findAllMinCardDiagnoses(obs, true);
+                clock_t all_t1 = clock();
+                obs_time += double(all_t1 - all_t0) / CLOCKS_PER_SEC;
+                // 超时判断
+                if (obs_time > TIME_LIMIT) {
+                    timeout = true;
+                }
+                // 统计所有诊断解的组件集合
+                for (const auto& d : all_diags) {
+                    for (int c : d) all_comps.insert(c);
+                }
+                // 统计真实组件数量
+                for (int c : all_comps) {
+                    if (obs.fault_set.count(c)) real_num++;
+                }
+                // 命中率
+                if (!all_comps.empty()) hitrate = 100.0 * real_num / all_comps.size();
+                num = all_diags.size();
+                // accumulate non-pseudo hitrate
+                total_hitrate_non_pseudo += hitrate;
+                non_pseudo_count++;
             } else {
-                cout << "Note: diagnosis cardinality (" << min_diag.size()
-                     << ") differs from true fault cardinality (" << obs.fault_set.size() << ")" << endl;
+                timeout = false;
+                min_size = 0;
+                num = 0;
+                hitrate = 0;
+                real_num = 0;
             }
-        }
-    }
-
-    if (find_all && !min_diag.empty()) {
-        cout << "\nFinding all minimal cardinality diagnoses..." << endl;
-        t0 = clock();
-        set<set<int>> all_diags = solver.findAllMinCardDiagnoses(obs);
-        t1 = clock();
-        cout << "Total minimal cardinality diagnoses: " << all_diags.size() << endl;
-        cout << "Time: " << double(t1 - t0) / CLOCKS_PER_SEC << " sec" << endl;
-        if (all_diags.size() <= 50) {
-            int idx = 1;
-            for (auto& d : all_diags) {
-                cout << "  Diagnosis " << idx++ << ": ";
-                for (int c : d) cout << c << " ";
-                cout << endl;
+            if (obs_time > TIME_LIMIT) {
+                timeout = true;
+                obs_time = TIME_LIMIT;
             }
+            total_time += obs_time;
+            total_hitrate += hitrate;
+            // 伪观测（min_diag 为空）也计为成功，只要不超时
+            if (!timeout) total_success++;
+            all_obs_time += obs_time;
+            // 输出一行
+            cout << left << setw(20) << obs_name
+                 << "|" << setw(8) << fixed << setprecision(2) << obs_time
+                 << "|" << setw(6) << num
+                 << "|" << setw(6) << min_size
+                 << "|" << setw(8) << all_comps.size()
+                 << "|" << setw(8) << real_num
+                 << "|" << setw(8) << fixed << setprecision(2) << hitrate
+                 << "|" << setw(8) << (timeout ? "1" : "0")
+                 << endl;
         }
+        // 最后一行输出总用时、平均用时、平均HITrate、成功率
+        double avg_time = obs_cnt > 0 ? all_obs_time / obs_cnt : 0;
+        double avg_hitrate = non_pseudo_count > 0 ? total_hitrate_non_pseudo / non_pseudo_count : 0;
+        double success_rate = obs_cnt > 0 ? 100.0 * total_success / obs_cnt : 0;
+        cout << string(80, '-') << endl;
+        cout << "TOTAL summary for " << obs_cnt << " observations:\n";
+        cout << "  total_time(s): " << fixed << setprecision(2) << all_obs_time << "\n";
+        cout << "  avg_time(s):   " << fixed << setprecision(2) << avg_time << "\n";
+        cout << "  avg_HITrate(%): " << fixed << setprecision(2) << avg_hitrate << "\n";
+        cout << "  success_rate(%): " << fixed << setprecision(2) << success_rate << "\n";
+        
+    } else {
+        cout << "=== SATbD: SAT-based Diagnosis ===" << endl;
+        cout << "Circuit: " << bench_file << endl;
+        cout << "Observation: " << obs_path << endl;
+        
+        if (use_bee) {
+            cout << "BEE: using built-in MiniBEE compiler/equi-propagation" << endl;
+        }
+        if (use_cryptominisat) {
+            string check_py = "python3 -c \"from pycryptosat import Solver\" >/dev/null 2>&1";
+            bool cms_available = (std::system(check_py.c_str()) == 0);
+            cout << "CryptoMiniSat (pycryptosat): " << (cms_available ? "available" : "not found") << endl;
+        }
+        
+        BatchResult result = process_single_obs(bench_file, obs_path, find_all, use_bee, use_cryptominisat);
+        
+        print_table_header();
+        for (const auto& dr : result.results) {
+            print_diagnosis_row(dr.obs_file, dr.diagnosis_index, dr.solved, 
+                               dr.cumulative_seconds, dr.diag_size, dr.diag_components);
+        }
+        print_batch_summary(result);
     }
 
     return 0;
