@@ -1030,6 +1030,62 @@ public:
         return enumerateAllMinDiagnosesOnModel(model, card, obs, time_limit);
     }
 
+    struct DiagnosisStats {
+        int num = 0;
+        set<int> union_comps;
+        int min_size = 0;
+        double elapsed = 0.0;
+        bool timed_out = false;
+    };
+
+    DiagnosisStats findAllMinCardDiagnosesStats(const Observation& obs, bool use_bee = false, double time_limit = 0.0) {
+        DiagnosisStats stats;
+        set<int> min_diag = use_bee ? findMinCardDiagnosisBEE(obs, false, true) : findMinCardDiagnosis(obs);
+        if (min_diag.empty()) { stats.min_size = 0; return stats; }
+        int card = (int)min_diag.size();
+        stats.min_size = card;
+        BEEModel bee;
+        CoreModel model;
+        if (use_bee) {
+            bee = equiPropagation(obs);
+            model = buildCoreModel(obs, &bee);
+        } else {
+            model = buildCoreModel(obs);
+        }
+
+        Minisat::Solver& S = *model.solver;
+        addCardinalityLits(S, model.unhealthy_lits, card);
+        int n = model.unhealthy_lits.size();
+        addCardinalityLits(S, model.healthy_lits, n - card);
+
+        clock_t start = clock();
+        while (S.solve()) {
+            set<int> diag = extractDiagnosis(circuit.get_component_gates(), model.health_vars, S);
+            Minisat::vec<Minisat::Lit> blocking;
+            for (int c : circuit.get_component_gates()) {
+                if (model.health_vars.count(c) == 0) continue;
+                Minisat::Var v = model.health_vars[c];
+                if (S.modelValue(mlit(v)) == l_False) blocking.push(mlit(v));
+                else blocking.push(~mlit(v));
+            }
+            S.addClause(blocking);
+
+            // expand TLD and stream stats (do not store all diagnoses)
+            set<set<int>> expanded = expandTLD(diag, obs);
+            for (auto& d : expanded) {
+                stats.num++;
+                for (int c : d) stats.union_comps.insert(c);
+            }
+
+            if (time_limit > 0.0) {
+                double elapsed = double(clock() - start) / CLOCKS_PER_SEC;
+                if (elapsed >= time_limit) { stats.timed_out = true; break; }
+            }
+        }
+        stats.elapsed = double(clock() - start) / CLOCKS_PER_SEC;
+        return stats;
+    }
+
     set<set<int>> expandTLD(const set<int>& tld, const Observation& obs) {
         vector<set<int>> chi_sets;
         for (int dom : tld) {
@@ -1829,8 +1885,14 @@ int main(int argc, char* argv[]) {
         double total_hitrate = 0; // legacy, kept for compatibility
         double total_hitrate_non_pseudo = 0; // only for non-pseudo obs
         int non_pseudo_count = 0;
+        double sum_time_non_pseudo = 0;
         int total_success = 0;
         double all_obs_time = 0;
+
+        // 解析电路并预处理一次，复用以节省内存/时间
+        Circuit circuit;
+        circuit.parse_bench(bench_file);
+        circuit.preprocess();
 
         for (const string& obs_file : obs_files) {
             clock_t t0 = clock();
@@ -1844,9 +1906,6 @@ int main(int argc, char* argv[]) {
             int num = 0;
             string obs_name = extract_filename(obs_file);
             Observation obs = parse_observation(obs_file);
-            Circuit circuit;
-            circuit.parse_bench(bench_file);
-            circuit.preprocess();
             SATbDSolver solver(circuit);
             // 限时300s
             const double TIME_LIMIT = 300.0;
@@ -1859,9 +1918,17 @@ int main(int argc, char* argv[]) {
                 min_size = min_diag.size();
                 // 枚举所有最小解
                 clock_t all_t0 = clock();
-                all_diags = solver.findAllMinCardDiagnoses(obs, true);
+                const double TIME_LIMIT = 300.0; // seconds
+                double remaining = TIME_LIMIT - obs_time;
+                if (remaining < 0) remaining = 0;
+                auto stats = solver.findAllMinCardDiagnosesStats(obs, true, remaining);
                 clock_t all_t1 = clock();
                 obs_time += double(all_t1 - all_t0) / CLOCKS_PER_SEC;
+                // 使用 streaming 统计结果
+                num = stats.num;
+                all_comps = stats.union_comps;
+                min_size = stats.min_size;
+                if (stats.timed_out) timeout = true;
                 // 超时判断
                 if (obs_time > TIME_LIMIT) {
                     timeout = true;
@@ -1891,6 +1958,7 @@ int main(int argc, char* argv[]) {
                 timeout = true;
                 obs_time = TIME_LIMIT;
             }
+            if (!is_pseudo) sum_time_non_pseudo += obs_time;
             total_time += obs_time;
             total_hitrate += hitrate;
             // 伪观测（min_diag 为空）也计为成功，只要不超时
@@ -1908,14 +1976,14 @@ int main(int argc, char* argv[]) {
                  << endl;
         }
         // 最后一行输出总用时、平均用时、平均HITrate、成功率
-        double avg_time = obs_cnt > 0 ? all_obs_time / obs_cnt : 0;
+        double avg_time = non_pseudo_count > 0 ? sum_time_non_pseudo / non_pseudo_count : 0;
         double avg_hitrate = non_pseudo_count > 0 ? total_hitrate_non_pseudo / non_pseudo_count : 0;
         double success_rate = obs_cnt > 0 ? 100.0 * total_success / obs_cnt : 0;
         cout << string(80, '-') << endl;
         cout << "TOTAL summary for " << obs_cnt << " observations:\n";
         cout << "  total_time(s): " << fixed << setprecision(2) << all_obs_time << "\n";
-        cout << "  avg_time(s):   " << fixed << setprecision(2) << avg_time << "\n";
-        cout << "  avg_HITrate(%): " << fixed << setprecision(2) << avg_hitrate << "\n";
+        cout << "  avg_time(s):   " << fixed << setprecision(3) << avg_time << "   ";
+        cout << "  avg_HITrate(%): " << fixed << setprecision(2) << avg_hitrate << "   ";
         cout << "  success_rate(%): " << fixed << setprecision(2) << success_rate << "\n";
         
     } else {
