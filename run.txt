@@ -1,0 +1,2 @@
+编译：g++ -O2 -std=c++17 -o satbd satbd.cpp -lminisat -lz
+运行：./satbd iscas85/bench/c5315.bench obs/c5315_10/obs --use-bee --use-cryptominisat --all
